@@ -1,0 +1,13 @@
+{
+  "//": "Copy this file to config.json (gitignored) and fill in real values. See README.",
+  "machineName": "desktop",
+  "botToken": "PASTE_TELEGRAM_BOT_TOKEN_FROM_BOTFATHER",
+  "allowedUserIds": [123456789],
+  "groupChatId": null,
+  "projectRoots": ["/path/to/your/projects"],
+  "projects": {},
+  "defaultModel": "opus",
+  "maxConcurrentTurns": 3,
+  "defaultMachine": "desktop",
+  "allowYolo": false
+}

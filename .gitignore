@@ -1,0 +1,19 @@
+# Secrets — never commit. Copy config.example.json to config.json and fill in.
+config.json
+*.local.json
+
+# Dependencies / build
+node_modules/
+dist/
+
+# Persistence (added in later slices)
+*.sqlite
+*.sqlite-journal
+data/
+
+# Logs / OS cruft
+*.log
+*.out.log
+*.err.log
+.DS_Store
+Thumbs.db
