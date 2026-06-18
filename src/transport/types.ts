@@ -7,7 +7,12 @@
  * fake implementation, so no test ever talks to real Telegram.
  */
 
-export type InboundEvent = MessageEvent | CommandEvent | CallbackEvent | TopicCreatedEvent;
+export type InboundEvent =
+  | MessageEvent
+  | CommandEvent
+  | CallbackEvent
+  | VoiceEvent
+  | TopicCreatedEvent;
 
 interface BaseEvent {
   /** Telegram user id of the sender. Checked against the allowlist. */
@@ -38,6 +43,21 @@ export interface CommandEvent extends BaseEvent {
   args: string;
   /** The full original text, for logging/echo. */
   text: string;
+}
+
+/**
+ * A voice note (or uploaded audio). The transport downloads the audio bytes;
+ * the router transcribes them and runs the text as a normal turn. Carries the
+ * bytes rather than a file id so the transcriber stays platform-agnostic.
+ */
+export interface VoiceEvent extends BaseEvent {
+  kind: "voice";
+  /** Raw audio bytes (OGG/Opus for Telegram voice notes). */
+  audio: Uint8Array;
+  /** Source content type, e.g. "audio/ogg". */
+  mime: string;
+  /** Clip length in seconds, for logging/UX. */
+  duration: number;
 }
 
 /** An inline-button press (used by the permission slice). */
@@ -106,7 +126,7 @@ export interface Transport {
 }
 
 /** Set of command names the control plane recognizes (extended in later slices). */
-const KNOWN_WORD_COMMANDS = new Set(["list", "new", "status"]);
+const KNOWN_WORD_COMMANDS = new Set(["list", "new", "create", "status"]);
 
 /**
  * Normalizes a raw text + metadata into a MessageEvent or CommandEvent.

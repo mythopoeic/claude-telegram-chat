@@ -14,6 +14,12 @@ export interface TopicRecord {
   model: string;
   /** Which machine handles this topic (shared-group delegation). */
   activeMachine: string;
+  /**
+   * When true, the session is told to answer tersely (concise mode) — easier to
+   * read on a phone. Toggled per-topic with /concise. Optional for backward
+   * compat with records written before this field existed (treated as false).
+   */
+  concise?: boolean;
 }
 
 /**

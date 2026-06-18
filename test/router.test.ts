@@ -5,8 +5,10 @@ import { FakeSession, FakeSessionFactory } from "../src/session/fake.js";
 import { registryFrom } from "../src/registry/discover.js";
 import { FakeStore } from "../src/store/fake.js";
 import { FakeCheckpointer } from "../src/checkpoint/fake.js";
+import { FakeTranscriber } from "../src/transcribe/fake.js";
+import type { Transcriber } from "../src/transcribe/types.js";
 import type { Config } from "../src/config.js";
-import type { CommandEvent, MessageEvent } from "../src/transport/types.js";
+import type { CommandEvent, MessageEvent, VoiceEvent } from "../src/transport/types.js";
 
 const quiet = { info: () => {}, warn: () => {} };
 const CHAT = -100;
@@ -23,6 +25,7 @@ function cfg(overrides: Partial<Config> = {}): Config {
     maxConcurrentTurns: 3,
     defaultMachine: "desktop",
     allowYolo: false,
+    transcription: null,
     ...overrides,
   };
 }
@@ -42,26 +45,45 @@ function cmd(command: string, args: string, topicId?: number): CommandEvent {
 function msg(text: string, topicId?: number): MessageEvent {
   return { kind: "message", text, senderId: 1, chatId: CHAT, topicId };
 }
+function voice(topicId?: number): VoiceEvent {
+  return {
+    kind: "voice",
+    audio: new Uint8Array([1, 2, 3]),
+    mime: "audio/ogg",
+    duration: 2,
+    senderId: 1,
+    chatId: CHAT,
+    topicId,
+  };
+}
 
 function setup(
   sessions = new FakeSessionFactory(),
   store = new FakeStore(),
   config = cfg(),
-  opts: { registry?: ReturnType<typeof reg>; pathExists?: (p: string) => boolean } = {},
+  opts: {
+    registry?: ReturnType<typeof reg>;
+    pathExists?: (p: string) => boolean;
+    transcriber?: Transcriber;
+    scaffoldProject?: (path: string) => Promise<void>;
+  } = {},
 ) {
   const transport = new FakeTransport();
   const checkpointer = new FakeCheckpointer();
+  const registry = opts.registry ?? reg();
   const router = createRouter({
     transport,
     config,
-    registry: opts.registry ?? reg(),
+    registry,
     sessions,
     store,
     checkpointer,
     logger: quiet,
+    transcriber: opts.transcriber,
     pathExists: opts.pathExists,
+    scaffoldProject: opts.scaffoldProject,
   });
-  return { transport, router, sessions, store, checkpointer };
+  return { transport, router, sessions, store, checkpointer, registry };
 }
 
 describe("help", () => {
@@ -385,6 +407,59 @@ describe("persistence", () => {
     expect(transport.lastText()).toContain("sonnet");
   });
 
+  it("/concise toggles, persists, and rebuilds the session with the flag", async () => {
+    const sessions = new FakeSessionFactory();
+    const { transport, router, store } = setup(sessions);
+    await router.handle(cmd("new", "app-A"));
+    const topicId = transport.topics[0]!.topicId;
+    expect(sessions.createdOpts.at(-1)?.concise).toBe(false);
+
+    await router.handle(cmd("concise", "", topicId));
+    expect(store.saves.at(-1)?.concise).toBe(true);
+    expect(transport.lastText()).toContain("concise mode on");
+    // Rebuilt live session carries the flag so the next turn is terse.
+    expect(sessions.createdOpts.at(-1)?.concise).toBe(true);
+
+    await router.handle(cmd("concise", "", topicId));
+    expect(store.saves.at(-1)?.concise).toBe(false);
+    expect(sessions.createdOpts.at(-1)?.concise).toBe(false);
+
+    await router.handle(cmd("concise", "on", topicId));
+    expect(store.saves.at(-1)?.concise).toBe(true);
+  });
+
+  it("/skill forwards a `/name args` slash command to the session as a turn", async () => {
+    const sessions = new FakeSessionFactory();
+    const session = new FakeSession("/repos/app-A");
+    sessions.prebuild("/repos/app-A", session);
+    const { transport, router } = setup(sessions);
+    await router.handle(cmd("new", "app-A"));
+    const topicId = transport.topics[0]!.topicId;
+
+    await router.handle(cmd("skill", "tdd add a health endpoint", topicId));
+    await router.idle();
+    expect(session.prompts).toContain("/tdd add a health endpoint");
+
+    // A bare name (and a stray leading slash) normalize to just `/name`.
+    await router.handle(cmd("skill", "/grilling", topicId));
+    await router.idle();
+    expect(session.prompts).toContain("/grilling");
+  });
+
+  it("/skill with no name shows usage and runs nothing", async () => {
+    const sessions = new FakeSessionFactory();
+    const session = new FakeSession("/repos/app-A");
+    sessions.prebuild("/repos/app-A", session);
+    const { transport, router } = setup(sessions);
+    await router.handle(cmd("new", "app-A"));
+    const topicId = transport.topics[0]!.topicId;
+
+    await router.handle(cmd("skill", "", topicId));
+    await router.idle();
+    expect(transport.lastText()).toContain("Usage:");
+    expect(session.prompts).toHaveLength(0);
+  });
+
   it("persists a remembered-allow so it survives restart", async () => {
     const sessions = new FakeSessionFactory();
     const session = new FakeSession("/repos/app-A");
@@ -399,6 +474,154 @@ describe("persistence", () => {
     await router.handle({ kind: "callback", data: rememberData, callbackId: "c", senderId: 1, chatId: CHAT, topicId });
 
     expect(store.saves.some((r) => r.remembered.includes("Bash"))).toBe(true);
+  });
+});
+
+describe("create", () => {
+  function withScaffold() {
+    const scaffolded: string[] = [];
+    const opts = {
+      scaffoldProject: async (p: string) => {
+        scaffolded.push(p);
+      },
+      pathExists: () => false,
+    };
+    return { scaffolded, opts };
+  }
+
+  it("scaffolds a new project, registers it live, and opens a topic", async () => {
+    const { scaffolded, opts } = withScaffold();
+    const { transport, router, store, registry } = setup(
+      new FakeSessionFactory(),
+      new FakeStore(),
+      cfg({ projectRoots: ["/repos"] }),
+      opts,
+    );
+
+    await router.handle(cmd("create", "fresh-app"));
+
+    expect(scaffolded).toHaveLength(1);
+    expect(scaffolded[0]).toMatch(/fresh-app$/);
+    expect(registry.resolve("fresh-app")?.name).toBe("fresh-app");
+    expect(transport.topics.some((t) => t.name === "fresh-app")).toBe(true);
+    expect(store.saves.some((r) => r.projectName === "fresh-app")).toBe(true);
+  });
+
+  it("refuses to clobber an existing project", async () => {
+    const { scaffolded, opts } = withScaffold();
+    const { transport, router } = setup(
+      new FakeSessionFactory(),
+      new FakeStore(),
+      cfg({ projectRoots: ["/repos"] }),
+      opts,
+    );
+    await router.handle(cmd("create", "app-A"));
+    expect(transport.lastText()).toContain("already exists");
+    expect(scaffolded).toHaveLength(0);
+  });
+
+  it("rejects an unsafe project name", async () => {
+    const { scaffolded, opts } = withScaffold();
+    const { transport, router } = setup(
+      new FakeSessionFactory(),
+      new FakeStore(),
+      cfg({ projectRoots: ["/repos"] }),
+      opts,
+    );
+    await router.handle(cmd("create", "../escape"));
+    expect(transport.lastText()).toMatch(/letters, digits/);
+    expect(scaffolded).toHaveLength(0);
+  });
+
+  it("errors when no projectRoot is configured", async () => {
+    const { scaffolded, opts } = withScaffold();
+    const { transport, router } = setup(new FakeSessionFactory(), new FakeStore(), cfg(), opts);
+    await router.handle(cmd("create", "fresh-app"));
+    expect(transport.lastText()).toContain("No projectRoot");
+    expect(scaffolded).toHaveLength(0);
+  });
+
+  it("honors `on <machine>` and stays silent when another machine is the target", async () => {
+    const { scaffolded, opts } = withScaffold();
+    const { transport, router, registry } = setup(
+      new FakeSessionFactory(),
+      new FakeStore(),
+      cfg({ projectRoots: ["/repos"] }), // desktop, primary
+      opts,
+    );
+
+    // Explicit `on desktop` → this (primary) machine creates it.
+    await router.handle(cmd("create", "alpha on desktop"));
+    expect(registry.resolve("alpha")?.name).toBe("alpha");
+    expect(transport.topics.some((t) => t.name === "alpha")).toBe(true);
+
+    // Targeting another machine → this one creates nothing and says nothing.
+    const before = scaffolded.length;
+    await router.handle(cmd("create", "beta on laptop"));
+    expect(scaffolded.length).toBe(before);
+    expect(registry.resolve("beta")).toBeUndefined();
+  });
+
+  it("a secondary machine creates only when it is the target", async () => {
+    const { scaffolded, opts } = withScaffold();
+    const { transport, router, registry } = setup(
+      new FakeSessionFactory(),
+      new FakeStore(),
+      cfg({ machineName: "laptop", defaultMachine: "desktop", projectRoots: ["/repos"] }),
+      opts,
+    );
+
+    // No target → defaults to the primary (desktop) → laptop stays silent.
+    await router.handle(cmd("create", "gamma"));
+    expect(registry.resolve("gamma")).toBeUndefined();
+    expect(scaffolded).toHaveLength(0);
+
+    // Explicit `on laptop` → this machine is the target and creates it.
+    await router.handle(cmd("create", "delta on laptop"));
+    expect(registry.resolve("delta")?.name).toBe("delta");
+    expect(transport.topics.some((t) => t.name === "delta")).toBe(true);
+  });
+});
+
+describe("voice", () => {
+  async function startTopic(transcriber?: Transcriber) {
+    const sessions = new FakeSessionFactory();
+    const session = new FakeSession("/repos/app-A");
+    sessions.prebuild("/repos/app-A", session);
+    const ctx = setup(sessions, new FakeStore(), cfg(), { transcriber });
+    await ctx.router.handle(cmd("new", "app-A"));
+    const topicId = ctx.transport.topics[0]!.topicId;
+    return { ...ctx, session, topicId };
+  }
+
+  it("transcribes a voice note, echoes it, and runs it as a turn", async () => {
+    const transcriber = new FakeTranscriber("add a health endpoint");
+    const { transport, router, session, topicId } = await startTopic(transcriber);
+
+    await router.handle(voice(topicId));
+    await router.idle();
+
+    expect(transcriber.calls).toHaveLength(1);
+    expect(transport.sent.some((s) => s.text.includes("heard: add a health endpoint"))).toBe(true);
+    expect(session.prompts).toContain("add a health endpoint");
+  });
+
+  it("refuses voice when no transcriber is configured", async () => {
+    const { transport, router, session, topicId } = await startTopic(undefined);
+    await router.handle(voice(topicId));
+    await router.idle();
+    expect(transport.lastText()).toContain("Voice isn't set up");
+    expect(session.prompts).toHaveLength(0);
+  });
+
+  it("reports a transcription failure without running a turn", async () => {
+    const transcriber = new FakeTranscriber();
+    transcriber.failWith = new Error("STT 401");
+    const { transport, router, session, topicId } = await startTopic(transcriber);
+    await router.handle(voice(topicId));
+    await router.idle();
+    expect(transport.lastText()).toContain("Couldn't transcribe");
+    expect(session.prompts).toHaveLength(0);
   });
 });
 

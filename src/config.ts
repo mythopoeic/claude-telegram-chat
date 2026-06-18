@@ -5,6 +5,16 @@ import { dirname, resolve } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
 
+/** Speech-to-text settings for voice notes. Absent/keyless → voice disabled. */
+export interface TranscriptionConfig {
+  /** Bearer token for the OpenAI-compatible STT endpoint (e.g. a Groq key). */
+  apiKey: string;
+  /** Base URL of the provider (default Groq's OpenAI-compatible endpoint). */
+  baseUrl: string;
+  /** Model id (default Groq's whisper-large-v3-turbo). */
+  model: string;
+}
+
 export interface Config {
   /** Human label for this machine, used in messages (e.g. "desktop"). */
   machineName: string;
@@ -39,6 +49,12 @@ export interface Config {
    * always primary/active, unchanged).
    */
   defaultMachine: string;
+  /**
+   * Speech-to-text for Telegram voice notes. Null when not configured (or the
+   * key is still a placeholder) — voice messages then get a "not configured"
+   * reply instead of failing the daemon at boot.
+   */
+  transcription: TranscriptionConfig | null;
 }
 
 /**
@@ -136,6 +152,8 @@ export function validateConfig(parsed: unknown): Config {
     throw new Error("config.allowYolo must be a boolean");
   }
 
+  const transcription = parseTranscription(o.transcription);
+
   return {
     machineName,
     botToken,
@@ -147,5 +165,37 @@ export function validateConfig(parsed: unknown): Config {
     maxConcurrentTurns,
     defaultMachine,
     allowYolo,
+    transcription,
   };
+}
+
+/**
+ * Parse the optional transcription block. A missing block, or one whose apiKey
+ * is empty or still the placeholder, yields null (voice disabled) rather than a
+ * hard error — so a fresh config without a Groq key still boots. baseUrl/model
+ * default to Groq's OpenAI-compatible Whisper endpoint.
+ */
+function parseTranscription(raw: unknown): TranscriptionConfig | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.transcription must be an object or null");
+  }
+  const t = raw as Record<string, unknown>;
+
+  const apiKey = t.apiKey;
+  if (typeof apiKey !== "string" || apiKey.length === 0 || apiKey.startsWith("PASTE_")) {
+    return null; // not configured yet — voice stays off, daemon still boots
+  }
+
+  const baseUrl = t.baseUrl ?? "https://api.groq.com/openai/v1";
+  if (typeof baseUrl !== "string" || baseUrl.length === 0) {
+    throw new Error("config.transcription.baseUrl must be a non-empty string");
+  }
+
+  const model = t.model ?? "whisper-large-v3-turbo";
+  if (typeof model !== "string" || model.length === 0) {
+    throw new Error("config.transcription.model must be a non-empty string");
+  }
+
+  return { apiKey, baseUrl, model };
 }

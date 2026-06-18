@@ -39,6 +39,10 @@ export function registryFrom(byName: Map<string, Project>): Registry {
     list: () =>
       [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)),
     resolve: (name) => lower.get(name.trim().toLowerCase()),
+    add: (project) => {
+      byName.set(project.name, project);
+      lower.set(project.name.toLowerCase(), project);
+    },
   };
 }
 

@@ -4,6 +4,7 @@ import type { Registry } from "./registry/types.js";
 import { createRouter } from "./router.js";
 import type { SessionFactory } from "./session/types.js";
 import type { Store } from "./store/types.js";
+import type { Transcriber } from "./transcribe/types.js";
 import type { InboundEvent, Transport } from "./transport/types.js";
 
 export interface Logger {
@@ -21,6 +22,8 @@ export interface DaemonDeps {
   sessions: SessionFactory;
   store: Store;
   checkpointer: Checkpointer;
+  /** Optional speech-to-text backend; absent means voice notes are refused. */
+  transcriber?: Transcriber;
   logger?: Logger;
 }
 
@@ -44,6 +47,7 @@ export function createDaemon(transport: Transport, config: Config, deps: DaemonD
     sessions: deps.sessions,
     store: deps.store,
     checkpointer: deps.checkpointer,
+    transcriber: deps.transcriber,
     logger,
   });
 

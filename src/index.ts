@@ -6,6 +6,7 @@ import { createDaemon } from "./daemon.js";
 import { discoverRegistry } from "./registry/discover.js";
 import { ClaudeSessionFactory } from "./session/claude.js";
 import { JsonStore } from "./store/json.js";
+import { WhisperTranscriber } from "./transcribe/whisper.js";
 import { TelegramTransport } from "./transport/telegram.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,7 +18,16 @@ async function main(): Promise<void> {
   const sessions = new ClaudeSessionFactory();
   const store = new JsonStore(resolve(repoRoot, "data", "topics.json"));
   const checkpointer = new GitCheckpointer();
-  const daemon = createDaemon(transport, config, { registry, sessions, store, checkpointer });
+  const transcriber = config.transcription
+    ? new WhisperTranscriber(config.transcription)
+    : undefined;
+  const daemon = createDaemon(transport, config, {
+    registry,
+    sessions,
+    store,
+    checkpointer,
+    transcriber,
+  });
 
   const shutdown = async (signal: string) => {
     console.log(`\n${signal} received, shutting down…`);
@@ -29,8 +39,9 @@ async function main(): Promise<void> {
 
   await daemon.start();
   const projectCount = registry.list().length;
+  const voice = transcriber ? "voice on" : "voice off";
   console.log(
-    `telegram-claude-bridge running as "${config.machineName}" — ${config.allowedUserIds.length} allowed user(s), ${projectCount} project(s).`,
+    `telegram-claude-bridge running as "${config.machineName}" — ${config.allowedUserIds.length} allowed user(s), ${projectCount} project(s), ${voice}.`,
   );
 }
 

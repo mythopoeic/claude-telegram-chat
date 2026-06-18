@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, type Context, InlineKeyboard } from "grammy";
 import type { MessageEntity } from "grammy/types";
 import { autoRetry } from "@grammyjs/auto-retry";
 import {
@@ -16,11 +16,13 @@ import {
  */
 export class TelegramTransport implements Transport {
   private readonly bot: Bot;
+  private readonly token: string;
   private handler: EventHandler | null = null;
   private runningPromise: Promise<void> | null = null;
   private stopping = false;
 
   constructor(botToken: string) {
+    this.token = botToken;
     this.bot = new Bot(botToken);
     // Transparently honor Telegram's retry_after on 429s instead of failing the
     // call. Belt-and-suspenders alongside the renderer's edit throttling.
@@ -106,6 +108,15 @@ export class TelegramTransport implements Transport {
       await this.dispatch(event);
     });
 
+    // Voice notes (press-and-hold) and uploaded audio both feed a turn once
+    // transcribed. We download the bytes here and hand them to the router.
+    this.bot.on("message:voice", (ctx) =>
+      this.onAudio(ctx, ctx.message.voice.mime_type, ctx.message.voice.duration),
+    );
+    this.bot.on("message:audio", (ctx) =>
+      this.onAudio(ctx, ctx.message.audio.mime_type, ctx.message.audio.duration),
+    );
+
     this.bot.on("message:forum_topic_created", async (ctx) => {
       const chat = ctx.chat;
       const threadId = ctx.message.message_thread_id;
@@ -134,6 +145,42 @@ export class TelegramTransport implements Transport {
       });
       // Acknowledge so Telegram stops showing a spinner on the button.
       await ctx.answerCallbackQuery().catch(() => {});
+    });
+  }
+
+  /**
+   * Download a voice/audio message's bytes via the Bot API file endpoint and
+   * emit a VoiceEvent. A failed download is logged and dropped rather than
+   * crashing the poller — the user can re-send. The allowlist is enforced
+   * downstream (in the daemon) on the emitted event's senderId.
+   */
+  private async onAudio(ctx: Context, mime: string | undefined, duration: number): Promise<void> {
+    const from = ctx.from;
+    const chat = ctx.chat;
+    if (!from || !chat) return;
+
+    let audio: Uint8Array;
+    try {
+      const file = await ctx.getFile();
+      if (!file.file_path) throw new Error("Telegram returned no file_path");
+      const url = `https://api.telegram.org/file/bot${this.token}/${file.file_path}`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`file download ${resp.status}`);
+      audio = new Uint8Array(await resp.arrayBuffer());
+    } catch (err) {
+      console.error(`voice download failed: ${err instanceof Error ? err.message : err}`);
+      return;
+    }
+
+    await this.dispatch({
+      kind: "voice",
+      audio,
+      mime: mime ?? "audio/ogg",
+      duration: duration ?? 0,
+      senderId: from.id,
+      chatId: chat.id,
+      topicId: ctx.message?.message_thread_id,
+      raw: ctx.update,
     });
   }
 

@@ -9,5 +9,11 @@
   "defaultModel": "opus",
   "maxConcurrentTurns": 3,
   "defaultMachine": "desktop",
-  "allowYolo": false
+  "allowYolo": false,
+  "//transcription": "Optional: enable voice notes. Leave the placeholder key to keep voice off. Defaults target Groq's Whisper; for OpenAI set baseUrl to https://api.openai.com/v1 and model to whisper-1.",
+  "transcription": {
+    "apiKey": "PASTE_GROQ_API_KEY",
+    "baseUrl": "https://api.groq.com/openai/v1",
+    "model": "whisper-large-v3-turbo"
+  }
 }

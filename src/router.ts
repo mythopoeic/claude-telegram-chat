@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Checkpointer } from "./checkpoint/types.js";
 import type { Config } from "./config.js";
 import type { Logger } from "./daemon.js";
@@ -7,8 +8,10 @@ import { PermissionController } from "./permission/controller.js";
 import { autonomyFromCommand } from "./permission/policy.js";
 import { Semaphore } from "./semaphore.js";
 import { createTurnRenderer } from "./render.js";
+import { scaffoldProject as defaultScaffoldProject } from "./registry/scaffold.js";
 import type { Registry } from "./registry/types.js";
 import type { Session, SessionFactory } from "./session/types.js";
+import type { Transcriber } from "./transcribe/types.js";
 import { recordKey, type Store, type TopicRecord } from "./store/types.js";
 import type {
   CallbackEvent,
@@ -16,6 +19,7 @@ import type {
   InboundEvent,
   MessageEvent,
   Transport,
+  VoiceEvent,
 } from "./transport/types.js";
 
 export interface RouterDeps {
@@ -26,8 +30,12 @@ export interface RouterDeps {
   store: Store;
   checkpointer: Checkpointer;
   logger: Logger;
+  /** Transcribes voice notes to text. Absent → voice messages are refused. */
+  transcriber?: Transcriber;
   /** Filesystem existence check; injectable so path-healing is unit-testable. */
   pathExists?: (path: string) => boolean;
+  /** Create + git-init a project directory; injectable for unit tests. */
+  scaffoldProject?: (path: string) => Promise<void>;
   /**
    * Grace a secondary waits on `new` before creating a topic itself, giving the
    * primary first claim (its forum_topic_created cancels the wait). Default 3s.
@@ -71,6 +79,7 @@ export function createRouter(deps: RouterDeps): Router {
   const notifier = new Notifier(deps.transport, deps.config.allowedUserIds);
   const permissions = new PermissionController(deps.transport, deps.logger, notifier);
   const pathExists = deps.pathExists ?? existsSync;
+  const scaffoldProject = deps.scaffoldProject ?? defaultScaffoldProject;
 
   // Machine identity for shared-group delegation. In a single-machine setup
   // defaultMachine === machineName, so this machine is always primary/active.
@@ -87,6 +96,7 @@ export function createRouter(deps: RouterDeps): Router {
   for (const record of deps.store.load()) {
     reconcileProjectPath(record);
     record.activeMachine = record.activeMachine ?? deps.config.defaultMachine;
+    record.concise = record.concise ?? false;
     const k = recordKey(record.chatId, record.topicId);
     records.set(k, record);
     permissions.restore(k, record.autonomy, record.remembered);
@@ -135,6 +145,8 @@ export function createRouter(deps: RouterDeps): Router {
         return handleCommand(event);
       case "message":
         return handleMessage(event);
+      case "voice":
+        return handleVoice(event);
       case "callback":
         return handleCallback(event);
     }
@@ -147,11 +159,17 @@ export function createRouter(deps: RouterDeps): Router {
    *   shared group doesn't get double replies.
    * - anything in a project topic → only the topic's active machine.
    */
-  function shouldHandle(event: CommandEvent | MessageEvent | CallbackEvent): boolean {
+  function shouldHandle(event: CommandEvent | MessageEvent | CallbackEvent | VoiceEvent): boolean {
     if (event.kind === "command") {
       // Every machine observes these: /use (so they agree on the active one),
-      // and list/new (each machine answers for its OWN projects).
-      if (event.command === "use" || event.command === "list" || event.command === "new") {
+      // list/new (each machine answers for its OWN projects), and /create (so a
+      // `create … on <machine>` can be claimed by the targeted machine).
+      if (
+        event.command === "use" ||
+        event.command === "list" ||
+        event.command === "new" ||
+        event.command === "create"
+      ) {
         return true;
       }
     }
@@ -184,6 +202,7 @@ export function createRouter(deps: RouterDeps): Router {
       remembered: [],
       model: deps.config.defaultModel,
       activeMachine: deps.config.defaultMachine,
+      concise: false,
     };
     records.set(k, record);
     deps.store.save(record);
@@ -206,12 +225,18 @@ export function createRouter(deps: RouterDeps): Router {
         return handleList(event);
       case "new":
         return handleNew(event);
+      case "create":
+        return handleCreate(event);
       case "status":
         return reply(event, formatStatus());
       case "model":
         return handleModel(event);
       case "quiet":
         return handleQuiet(event);
+      case "concise":
+        return handleConcise(event);
+      case "skill":
+        return handleSkill(event);
       case "use":
         return handleUse(event);
       case "stop":
@@ -351,6 +376,73 @@ export function createRouter(deps: RouterDeps): Router {
     );
   }
 
+  /**
+   * Toggle concise mode for this topic. `on`/`off` set it explicitly; no arg
+   * flips it. Persisted on the record and applied by rebuilding the live session
+   * (if any) — resuming the same conversation by id, like /model — so the system
+   * prompt change takes effect on the next turn.
+   */
+  async function handleConcise(event: CommandEvent): Promise<void> {
+    if (event.topicId === undefined) {
+      return reply(event, "Use `/concise` inside a project topic.");
+    }
+    const topicId = event.topicId;
+    const k = key(event.chatId, topicId);
+    const record = records.get(k);
+    if (!record) {
+      return reply(event, "Use `/concise` inside a project topic.");
+    }
+    const arg = event.args.trim().toLowerCase();
+    const on = arg === "on" ? true : arg === "off" ? false : !(record.concise ?? false);
+    record.concise = on;
+    deps.store.save(record);
+    if (bound.has(k)) bound.set(k, resume(record, event.chatId, topicId));
+    await reply(
+      event,
+      on
+        ? "✂️ concise mode on — terse replies, easier to read on a phone. `/concise off` to revert."
+        : "concise mode off — full replies.",
+    );
+  }
+
+  /**
+   * `/skill <name> [instructions]` runs a skill in this topic by forwarding the
+   * slash command to the session as a normal user turn. The Agent SDK expands a
+   * `/<name>` prompt as a slash command — so this invokes the skill exactly as
+   * typing it in the CLI would, which also reaches skills marked
+   * `disable-model-invocation` that the model can't trigger on its own. Any
+   * extra words are passed through as the skill's arguments.
+   */
+  async function handleSkill(event: CommandEvent): Promise<void> {
+    if (event.topicId === undefined) {
+      return reply(event, "Use `/skill <name>` inside a project topic.");
+    }
+    const raw = event.args.trim();
+    if (!raw) {
+      return reply(event, "Usage: `/skill <name> [instructions]` — e.g. `/skill tdd add a health endpoint`.");
+    }
+    const k = key(event.chatId, event.topicId);
+    const record = records.get(k);
+    if (!record) {
+      return reply(event, "No active session in this topic. Use `new <project>` in General.");
+    }
+    // First token is the skill name (tolerate a leading slash); the rest are args.
+    const firstToken = raw.split(/\s+/, 1)[0] ?? "";
+    const rest = raw.slice(firstToken.length).trim();
+    const name = firstToken.replace(/^\/+/, "");
+    const prompt = rest ? `/${name} ${rest}` : `/${name}`;
+
+    if (!bound.has(k)) bound.set(k, resume(record, event.chatId, event.topicId));
+    await reply(event, `▶️ running skill \`${name}\`…`);
+    enqueue(k, {
+      kind: "message",
+      text: prompt,
+      senderId: event.senderId,
+      chatId: event.chatId,
+      topicId: event.topicId,
+    });
+  }
+
   async function handleModel(event: CommandEvent): Promise<void> {
     if (event.topicId === undefined) {
       return reply(event, "Use `/model` inside a project topic.");
@@ -380,15 +472,19 @@ export function createRouter(deps: RouterDeps): Router {
       "Available now:",
       "• `list` — show registered projects",
       "• `new <project>` — open a topic and start a session",
+      "• `create <name> [on <machine>]` — scaffold a new project (defaults to primary)",
       "• `status` — show active sessions, autonomy, and model",
       "• `/model <name>` — set this topic's model",
       "• `/yolo` · `/careful` · `/tiered` — set a topic's approval mode",
       "• `/use <machine>` — choose which machine handles this topic",
       "• `/quiet` — mute turn-complete pings for this topic",
+      "• `/concise` — toggle terse replies for this topic",
+      "• `/skill <name> [instructions]` — run a skill in this topic",
       "• `/stop` — abort the current turn and clear the queue",
       "• `/undo` · `/diff` — rewind / inspect the last turn's changes",
       "• `help` — this message",
       "",
+      "Send a voice note in a topic and it's transcribed into a turn.",
       "Messages mid-turn queue; turns across topics run in parallel.",
       "You're pinged on approvals, turn completion, and errors.",
       "Each turn is checkpointed; /undo rewinds it. Sessions resume after restart.",
@@ -421,7 +517,8 @@ export function createRouter(deps: RouterDeps): Router {
     if (records.size === 0) return "No sessions.";
     const lines = [...records.entries()].map(([k, r]) => {
       const live = bound.has(k) ? "live" : "idle";
-      return `• ${r.projectName} — →${r.activeMachine}, ${permissions.mode(k)}, ${r.model} (${live})`;
+      const concise = r.concise ? ", concise" : "";
+      return `• ${r.projectName} — →${r.activeMachine}, ${permissions.mode(k)}, ${r.model}${concise} (${live})`;
     });
     return `Sessions:\n${lines.join("\n")}`;
   }
@@ -461,6 +558,78 @@ export function createRouter(deps: RouterDeps): Router {
     pendingNew.set(nameKey, timer);
   }
 
+  /**
+   * `/create <name> [on <machine>]` scaffolds a brand-new project that doesn't
+   * exist yet: it makes `<first projectRoot>/<name>`, git-inits it, registers it
+   * in the live registry, and opens a topic — same as `new` from there on.
+   *
+   * In a shared group every daemon observes the command; the *targeted* machine
+   * (default: the primary) is the one that actually creates the project and
+   * replies, so the others stay silent. Unlike `new` (which stays silent for
+   * unknown names so the other machine can claim them), create is explicit, so
+   * it validates the name and refuses to clobber an existing project/directory.
+   */
+  async function handleCreate(event: CommandEvent): Promise<void> {
+    const parts = event.args.trim().split(/\s+/).filter(Boolean);
+    const name = parts[0] ?? "";
+
+    // Optional `on <machine>` target; anything else after the name is a usage
+    // error. Default target is the primary machine (unchanged single-machine
+    // behavior). The primary owns the usage replies so only one machine speaks.
+    let target = defaultMachine;
+    if (parts.length > 1) {
+      if (parts.length === 3 && parts[1]!.toLowerCase() === "on") {
+        target = parts[2]!.toLowerCase();
+      } else {
+        if (isPrimary) {
+          await reply(event, "Usage: `create <name> [on <machine>]` — defaults to the primary machine.");
+        }
+        return;
+      }
+    }
+    if (!name) {
+      if (isPrimary) {
+        await reply(event, "Usage: `create <name> [on <machine>]` — scaffolds a new project and opens a topic.");
+      }
+      return;
+    }
+
+    // Only the targeted machine creates the project (and validates/replies);
+    // every other daemon that observed the command stays silent.
+    if (target !== me) return;
+
+    // Names become directory and topic names — keep them safe (no spaces,
+    // slashes, or dot-only traversal).
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name === "." || name === "..") {
+      await reply(event, "Project names may use letters, digits, dash, underscore and dot — no spaces or slashes.");
+      return;
+    }
+    if (deps.registry.resolve(name)) {
+      await reply(event, `A project named "${name}" already exists — use \`new ${name}\` to open it.`);
+      return;
+    }
+    const root = deps.config.projectRoots[0];
+    if (!root) {
+      await reply(event, "No projectRoot configured — add one to config.json before creating projects.");
+      return;
+    }
+    const path = resolve(root, name);
+    if (pathExists(path)) {
+      await reply(event, `Something already exists at ${path}. Pick another name, or add it via config.`);
+      return;
+    }
+    try {
+      await scaffoldProject(path);
+    } catch (err) {
+      await reply(event, `Couldn't create the project: ${(err as Error).message}`);
+      return;
+    }
+    const project = { name, path };
+    deps.registry.add(project);
+    deps.logger.info(`created project "${name}" at ${path}`);
+    await createTopicFor(event.chatId, project);
+  }
+
   /** Create a topic for a project on THIS machine and bind it as the creator. */
   async function createTopicFor(
     chatId: number,
@@ -489,6 +658,7 @@ export function createRouter(deps: RouterDeps): Router {
       remembered: [],
       model: deps.config.defaultModel,
       activeMachine: deps.config.machineName, // the creator handles it by default
+      concise: false,
     };
     records.set(k, record);
     deps.store.save(record);
@@ -508,8 +678,47 @@ export function createRouter(deps: RouterDeps): Router {
       model: record.model,
       resumeId: record.sessionId ?? undefined,
       permission: permissions.handlerFor(chatId, topicId, recordKey(chatId, topicId)),
+      concise: record.concise ?? false,
     });
     return { session, record };
+  }
+
+  /**
+   * A voice note: transcribe it, echo the transcript back (so the user can
+   * catch a misheard word), then run it through the normal message path as the
+   * turn's prompt. The transcript is fed as a plain message, not re-parsed for
+   * commands — speak to Claude, type your slash-commands.
+   */
+  async function handleVoice(event: VoiceEvent): Promise<void> {
+    if (event.topicId === undefined) {
+      return reply(event, "Send voice notes inside a project topic — that's where a session lives.");
+    }
+    if (!deps.transcriber) {
+      return reply(
+        event,
+        "Voice isn't set up on this machine. Add a `transcription` block (Groq/OpenAI key) to config.json.",
+      );
+    }
+
+    let text: string;
+    try {
+      text = await deps.transcriber.transcribe(event.audio, event.mime);
+    } catch (err) {
+      deps.logger.warn(`transcription failed: ${(err as Error).message}`);
+      return reply(event, `Couldn't transcribe that voice note: ${(err as Error).message}`);
+    }
+    if (!text) {
+      return reply(event, "I couldn't make out any speech in that voice note.");
+    }
+
+    await reply(event, `🎙️ heard: ${text}`);
+    await handleMessage({
+      kind: "message",
+      text,
+      senderId: event.senderId,
+      chatId: event.chatId,
+      topicId: event.topicId,
+    });
   }
 
   async function handleMessage(event: MessageEvent): Promise<void> {

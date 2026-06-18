@@ -58,6 +58,8 @@ export interface CreateSessionOptions {
   resumeId?: string;
   /** Per-tool permission decision. If omitted, the session is read-only-safe. */
   permission?: PermissionHandler;
+  /** When true, append a be-terse instruction to the system prompt. */
+  concise?: boolean;
 }
 
 export interface SessionFactory {

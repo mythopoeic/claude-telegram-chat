@@ -12,6 +12,7 @@ const valid = {
   maxConcurrentTurns: 3,
   defaultMachine: "desktop",
   allowYolo: false,
+  transcription: null,
 };
 
 describe("validateConfig", () => {
@@ -63,5 +64,35 @@ describe("validateConfig", () => {
 
   it("rejects a non-object", () => {
     expect(() => validateConfig(null)).toThrow(/object/);
+  });
+
+  it("defaults transcription to null when omitted", () => {
+    const { transcription: _t, ...rest } = valid;
+    expect(validateConfig(rest).transcription).toBeNull();
+  });
+
+  it("treats a placeholder/empty transcription key as disabled (null)", () => {
+    expect(
+      validateConfig({ ...valid, transcription: { apiKey: "PASTE_GROQ_API_KEY" } }).transcription,
+    ).toBeNull();
+    expect(validateConfig({ ...valid, transcription: { apiKey: "" } }).transcription).toBeNull();
+  });
+
+  it("parses a configured transcription block with Groq defaults", () => {
+    const c = validateConfig({ ...valid, transcription: { apiKey: "gsk_real" } });
+    expect(c.transcription).toEqual({
+      apiKey: "gsk_real",
+      baseUrl: "https://api.groq.com/openai/v1",
+      model: "whisper-large-v3-turbo",
+    });
+  });
+
+  it("honors a custom transcription baseUrl/model (e.g. OpenAI)", () => {
+    const c = validateConfig({
+      ...valid,
+      transcription: { apiKey: "sk_real", baseUrl: "https://api.openai.com/v1", model: "whisper-1" },
+    });
+    expect(c.transcription?.baseUrl).toBe("https://api.openai.com/v1");
+    expect(c.transcription?.model).toBe("whisper-1");
   });
 });

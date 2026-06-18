@@ -17,3 +17,7 @@ data/
 *.err.log
 .DS_Store
 Thumbs.db
+
+# Skill-installer artifacts (skills live at the user level, not vendored here)
+.agents/
+skills-lock.json

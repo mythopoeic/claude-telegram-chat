@@ -9,6 +9,12 @@ import {
   type SessionFactory,
 } from "./types.js";
 
+/**
+ * Appended to the system prompt in concise mode. Kept blunt on purpose: replies
+ * land in Telegram, where terse output is far easier to read on a phone.
+ */
+const CONCISE_INSTRUCTION = "Be extremely concise. Sacrifice grammar for the sake of concision.";
+
 /** Loose view of a content block — avoids importing the full Anthropic types. */
 interface Block {
   type: string;
@@ -33,12 +39,14 @@ export class ClaudeSession implements Session {
   readonly cwd: string;
   private readonly model: string;
   private readonly permission: PermissionHandler | undefined;
+  private readonly concise: boolean;
   private abortController: AbortController | null = null;
 
   constructor(opts: CreateSessionOptions) {
     this.cwd = opts.cwd;
     this.model = opts.model;
     this.permission = opts.permission;
+    this.concise = opts.concise ?? false;
     this.id = opts.resumeId ?? null;
   }
 
@@ -52,6 +60,16 @@ export class ClaudeSession implements Session {
       // Project parity: load the repo's CLAUDE.md, .claude settings, skills,
       // subagents, and MCP servers, plus the user's global config.
       settingSources: ["user", "project", "local"],
+      // Surface every discovered skill (user-level + the project's own .claude)
+      // to the model — the SDK treats this as the single switch that turns skills
+      // on, so omitting it can leave them invisible over Telegram. It's a context
+      // filter, not a sandbox; 'all' just means "list them all for invocation".
+      skills: "all",
+      // Concise mode appends a be-terse instruction to the Claude Code preset;
+      // off, we leave systemPrompt unset so the default preset applies unchanged.
+      ...(this.concise
+        ? { systemPrompt: { type: "preset", preset: "claude_code", append: CONCISE_INSTRUCTION } as const }
+        : {}),
       tools: { type: "preset", preset: "claude_code" },
       abortController: abort,
       canUseTool: async (toolName, input, { signal, toolUseID }): Promise<PermissionResult> => {
